@@ -22,7 +22,18 @@ TRAIN_IDS_PATH = str(_ROOT / "data" / "training" / "ids_fixed.mat")
 TRAIN_XLSX_PATH = str(_ROOT / "data" / "training" / "data_train.xlsx")
 TEST_DIR = str(_ROOT / "data" / "testing")
 
-FEATURE_NAMES = [f"F{i+1:02d}" for i in range(49)]
+FEATURE_NAMES = [f"F{i+1:02d}" for i in range(48)]
+
+FEATURE_FAMILY_MAP = {
+    "pitch":         list(range(0, 10)),
+    "formants":      list(range(10, 20)),
+    "jitter":        [20, 21],
+    "voicing":       [22, 23],
+    "energy":        list(range(24, 32)),
+    "zero_crossing": list(range(32, 38)),
+    "spsl":          list(range(38, 46)),
+    "duration":      [46, 47],
+}
 
 GENDER_IDX = 1
 MODULE_IDX = 10
@@ -56,16 +67,26 @@ def flatten_to_NWF(X):
     return X.reshape(X.shape[0], -1, X.shape[-1])
 
 def collapse_subject(X):
-    if USING_GPU:
-        X_gpu = XP.asarray(X)
-        if REDUCER == "mean":
-            return to_numpy(XP.nanmean(X_gpu, axis=1))
-        if REDUCER == "median":
-            return to_numpy(XP.nanmedian(X_gpu, axis=1))
-    if REDUCER == "mean":
-        return np.nanmean(X, axis=1)
-    if REDUCER == "median":
-        return np.nanmedian(X, axis=1)
+    # X: (N, W, F) — drop samples where any feature is NaN, then reduce
+    result = np.full((X.shape[0], X.shape[2]), np.nan)
+    for i in range(X.shape[0]):
+        s = X[i]  # (W, F)
+        keep = np.isfinite(s).all(axis=1)
+        s = s[keep]
+        if s.shape[0] == 0:
+            continue
+        if USING_GPU:
+            s_gpu = XP.asarray(s)
+            if REDUCER == "mean":
+                result[i] = to_numpy(XP.mean(s_gpu, axis=0))
+            elif REDUCER == "median":
+                result[i] = to_numpy(XP.median(s_gpu, axis=0))
+        else:
+            if REDUCER == "mean":
+                result[i] = np.mean(s, axis=0)
+            elif REDUCER == "median":
+                result[i] = np.median(s, axis=0)
+    return result
 
 def corr_pair(x,y,method):
     m = np.isfinite(x)&np.isfinite(y)
@@ -90,24 +111,48 @@ def corr_matrix(X,method):
     return R,P
 
 def save_bundle(X_nwf, tag):
-    X_nf = collapse_subject(X_nwf)
+    X_nf = collapse_subject(X_nwf)[:, :48]
 
-    Rp, _ = corr_matrix(X_nf, "pearson")
     Rs, _ = corr_matrix(X_nf, "spearman")
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+    # Upper triangle only — mask lower triangle with NaN
+    F = Rs.shape[0]
+    M = Rs.copy().astype(float)
+    M[np.tril_indices(F, k=-1)] = np.nan
 
-    for ax, M, title in [
-        (axes[0], Rp, f"Pearson  —  {tag}"),
-        (axes[1], Rs, f"Spearman  —  {tag}"),
-    ]:
-        im = ax.imshow(M, aspect="auto", vmin=-1, vmax=1)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(title, fontsize=13)
-        ax.set_xticks(range(len(FEATURE_NAMES)))
-        ax.set_yticks(range(len(FEATURE_NAMES)))
-        ax.set_xticklabels(FEATURE_NAMES, rotation=90, fontsize=6)
-        ax.set_yticklabels(FEATURE_NAMES, fontsize=6)
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad("white")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(M, aspect="auto", vmin=-1, vmax=1, cmap=cmap)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("Spearman correlation", fontsize=12)
+    ax.set_xticks(range(len(FEATURE_NAMES)))
+    ax.set_yticks(range(len(FEATURE_NAMES)))
+    ax.set_xticklabels(FEATURE_NAMES, rotation=90, fontsize=12)
+    ax.set_yticklabels(FEATURE_NAMES, fontsize=12)
+
+    # Family boundary lines and labels
+    boundaries = set()
+    for indices in FEATURE_FAMILY_MAP.values():
+        boundaries.add(min(indices))
+        boundaries.add(max(indices) + 1)
+    boundaries.discard(0)
+    boundaries.discard(F)
+    for b in sorted(boundaries):
+        ax.axvline(b - 0.5, color="gray", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.axhline(b - 0.5, color="gray", linewidth=0.8, linestyle="--", alpha=0.6)
+
+    labels_sorted = sorted(
+        [(name, (min(idx) + max(idx)) / 2) for name, idx in FEATURE_FAMILY_MAP.items()],
+        key=lambda t: t[1],
+    )
+    for i, (name, mid) in enumerate(labels_sorted):
+        y = -1 if i % 2 == 0 else -2.5
+        ax.text(mid, y, name, ha="center", va="bottom", fontsize=12,
+                color="dimgray", style="italic", clip_on=False)
+        ax.text(-4.0, mid, name, ha="right", va="center", fontsize=12,
+                color="dimgray", style="italic", clip_on=False)
 
     fig.tight_layout()
     out = OUT_MAP_DIR / f"{tag}.png"
@@ -144,4 +189,3 @@ if np.any(m): save_bundle(Xall[m], "all_ages_male")
 if np.any(f): save_bundle(Xall[f], "all_ages_female")
 
 print("Done.")
-

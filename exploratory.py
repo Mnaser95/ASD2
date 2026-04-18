@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr, rankdata
+from scipy.stats import spearmanr
 from data_import import load_all_data
 from gpu_utils import require_accelerators, get_array_backend, to_numpy, log_runtime_gpu_status
 
@@ -19,7 +19,6 @@ SCENARIOS = [               # (output_tag, exclude_module4_adults)
 
 GENDER_IDX = 1              # column index of gender in y
 MODULE_IDX = 10             # column index of module in y
-N_PERM     = 1000           # permutations for Pearson significance test
 ALPHA      = 0.05           # significance threshold
 
 Y_COL_NAMES = [             # label for each y column (0-based)
@@ -58,7 +57,7 @@ X_train_flat = X_train.reshape(X_train.shape[0], -1, X_train.shape[-1])
 X_T1_flat    = X_T1.reshape(X_T1.shape[0],    -1, X_T1.shape[-1])
 X_T2_flat    = X_T2.reshape(X_T2.shape[0],    -1, X_T2.shape[-1])
 
-X_all_flat = np.concatenate([X_train_flat, X_T1_flat, X_T2_flat], axis=0)
+X_all_flat = np.concatenate([X_train_flat, X_T1_flat, X_T2_flat], axis=0)[:, :, :48]
 y_all      = np.concatenate([y_train, y_T1, y_T2], axis=0)
 
 # =========================
@@ -101,7 +100,7 @@ def apply_module4_filter(X, y, exclude: bool):
 # =========================
 # STATISTICS
 # =========================
-def compute_stats(x_feat_1d, y_col_1d, seed=0, n_perm=N_PERM):
+def compute_stats(x_feat_1d, y_col_1d):
     x = np.asarray(x_feat_1d, dtype=float)
     y = np.asarray(y_col_1d,  dtype=float)
 
@@ -109,23 +108,12 @@ def compute_stats(x_feat_1d, y_col_1d, seed=0, n_perm=N_PERM):
     x, y = x[mask], y[mask]
 
     if x.size < 2 or np.all(x == x[0]) or np.all(y == y[0]):
-        return np.nan, np.nan, False, np.nan, np.nan, int(x.size)
+        return np.nan, np.nan, int(x.size)
 
-    r_obs, _ = pearsonr(x, y)
+    rho, p_spearman = spearmanr(x, y)
+    return rho, p_spearman, int(x.size)
 
-    rng    = np.random.default_rng(seed)
-    r_null = np.empty(n_perm, dtype=float)
-    for i in range(n_perm):
-        yp = rng.permutation(y)
-        r_null[i] = 0.0 if np.all(yp == yp[0]) else pearsonr(x, yp)[0]
-
-    p_emp = (np.sum(np.abs(r_null) >= np.abs(r_obs)) + 1) / (n_perm + 1)
-    sig_pearson = np.abs(r_obs) > np.percentile(np.abs(r_null), 97.5)
-
-    rho, p_spearman = pearsonr(rankdata(x), rankdata(y))
-    return r_obs, p_emp, sig_pearson, rho, p_spearman, int(x.size)
-
-def run_for_dataset(X, y, y_col_idx, seed_base=0):
+def run_for_dataset(X, y, y_col_idx):
     y_col = y[:, y_col_idx]
     rows  = []
 
@@ -133,15 +121,10 @@ def run_for_dataset(X, y, y_col_idx, seed_base=0):
         x_feat = (to_numpy(XP.asarray(X[:, :, j]).mean(axis=1))
                   if USING_GPU else X[:, :, j].mean(axis=1))
 
-        r, p_emp, sig_pearson, rho, p_spearman, n = compute_stats(
-            x_feat, y_col, seed=seed_base + 2000 * y_col_idx + j
-        )
+        rho, p_spearman, n = compute_stats(x_feat, y_col)
 
         rows.append({
             "feature_idx":      j,
-            "pearson_r":        r,
-            "pearson_p_emp":    p_emp,
-            "pearson_sig":      sig_pearson,
             "spearman_rho":     rho,
             "spearman_p":       p_spearman,
             "spearman_sig":     bool(p_spearman < ALPHA) if np.isfinite(p_spearman) else False,
@@ -168,7 +151,6 @@ FEATURE_FAMILY_MAP = {
     "zero_crossing":list(range(32, 38)),
     "spsl":         list(range(38, 46)),
     "duration":     [46, 47],
-    "quantity":     [48],
 }
 
 def _add_family_annotations(ax, n_feats, family_map, y_min, y_max):
@@ -183,10 +165,14 @@ def _add_family_annotations(ax, n_feats, family_map, y_min, y_max):
     for b in sorted(boundaries):
         ax.axvline(b - 0.5, color="gray", linewidth=0.8, linestyle="--", alpha=0.6)
 
-    y_label = y_max + (y_max - y_min) * 0.04
-    for name, indices in family_map.items():
-        mid = (min(indices) + max(indices)) / 2
-        ax.text(mid, y_label, name, ha="center", va="bottom", fontsize=9,
+    y_base = y_max + (y_max - y_min) * 0.04
+
+    labels = sorted(
+        [(name, (min(idx) + max(idx)) / 2) for name, idx in family_map.items()],
+        key=lambda t: t[1],
+    )
+    for name, mid in labels:
+        ax.text(mid, y_base, name, ha="center", va="bottom", fontsize=18,
                 color="dimgray", style="italic")
 
 def plot_grouped_bars(datasets, title, out_path):
@@ -197,54 +183,173 @@ def plot_grouped_bars(datasets, title, out_path):
     width = 0.8 / n_groups
     x = np.arange(n_feats)
 
-    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(22, 10), sharex=True)
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(22, 10))
 
-    for panel, (metric, p_col, ylabel) in enumerate([
-        ("pearson_r",    "pearson_p_emp", "Pearson r"),
-        ("spearman_rho", "spearman_p",    "Spearman ρ"),
-    ]):
-        ax = axes[panel]
-        ax.axhline(0, linewidth=1, color="black")
+    ax.axhline(0, linewidth=1, color="black")
 
-        all_vals = []
-        for g_idx, (label, df) in enumerate(datasets):
-            df = df.sort_values("feature_idx").reset_index(drop=True)
-            vals = df[metric].to_numpy(dtype=float)
-            ps   = df[p_col].to_numpy(dtype=float)
-            color = GROUPS[g_idx][1]
-            offset = (g_idx - (n_groups - 1) / 2) * width
+    for g_idx, (label, df) in enumerate(datasets):
+        df = df.sort_values("feature_idx").reset_index(drop=True)
+        vals = df["spearman_rho"].to_numpy(dtype=float)
+        ps   = df["spearman_p"].to_numpy(dtype=float)
+        color = GROUPS[g_idx][1]
+        offset = (g_idx - (n_groups - 1) / 2) * width
 
-            ax.bar(x + offset, vals, width=width, label=label, color=color, alpha=0.85)
-            all_vals.append(vals)
+        ax.bar(x + offset, vals, width=width, label=label, color=color, alpha=0.85)
 
-            for i in np.where(np.isfinite(ps) & (ps < ALPHA))[0]:
-                v = vals[i]
-                stars = "***" if ps[i] < 0.0005 else "**" if ps[i] < 0.005 else "*"
-                ax.text(x[i] + offset, v + (0.02 if v >= 0 else -0.02), stars,
-                        ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+        for i in np.where(np.isfinite(ps) & (ps < ALPHA))[0]:
+            v = vals[i]
+            stars = "***" if ps[i] < 0.0005 else "**" if ps[i] < 0.005 else "*"
+            ax.text(x[i] + offset, v + (0.02 if v >= 0 else -0.02), stars,
+                    ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
 
-        ax.set_ylim(-0.6, 0.6)
-        _add_family_annotations(ax, n_feats, FEATURE_FAMILY_MAP, -0.6, 0.6)
+    ax.set_ylim(-0.6, 0.6)
+    _add_family_annotations(ax, n_feats, FEATURE_FAMILY_MAP, -0.6, 0.6)
 
-        ax.set_ylabel(ylabel, fontsize=14)
-        if panel == 0:
-            ax.set_title(title, fontsize=16)
-            from matplotlib.lines import Line2D
-            handles, _ = ax.get_legend_handles_labels()
-            handles += [
-                Line2D([], [], linestyle="none", label="* p < 0.05"),
-                Line2D([], [], linestyle="none", label="** p < 0.005"),
-                Line2D([], [], linestyle="none", label="*** p < 0.0005"),
-            ]
-            ax.legend(handles=handles, fontsize=12)
+    ax.tick_params(axis="y", labelsize=28)
+    ax.set_ylabel("Spearman ρ", fontsize=24)
+    ax.set_title(title, fontsize=24)
+    from matplotlib.lines import Line2D
+    handles, _ = ax.get_legend_handles_labels()
+    handles += [
+        Line2D([], [], linestyle="none", label="* p < 0.05"),
+        Line2D([], [], linestyle="none", label="** p < 0.005"),
+        Line2D([], [], linestyle="none", label="*** p < 0.0005"),
+    ]
+    ax.legend(handles=handles, fontsize=17)
 
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(feature_labels, rotation=90, ha="center", fontsize=9)
-    axes[1].set_xlabel("Features", fontsize=14)
+    ax.set_xticks(x)
+    ax.set_xticklabels(feature_labels, rotation=90, ha="center", fontsize=22)
+    ax.set_xlabel("Features", fontsize=24)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
+
+# =========================
+# GENDER BALANCE ANALYSIS
+# =========================
+N_BOOTSTRAP_REPS    = 1000  # repetitions for bootstrap CI
+N_PERMUTATION_REPS  = 1000  # repetitions for permutation test
+BOOTSTRAP_CI        = 95    # confidence interval percentage
+RNG_SEED            = 42
+
+BALANCE_DIR = OUT_DIR / "gender_balance"
+BALANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def run_bootstrap_ci(X, y, col_idx, n_reps, ci, seed, resample_size=None):
+    """
+    Bootstrap CI for Spearman rho per feature.
+    resample_size: number of subjects drawn per bootstrap sample.
+                   Pass min(N_male, N_female) for both groups to equalise CI width.
+    Returns DataFrame with mean rho, lower and upper CI bounds.
+    """
+    n_feats  = X.shape[2]
+    rng      = np.random.default_rng(seed)
+    size     = resample_size if resample_size is not None else X.shape[0]
+    all_rhos = np.full((n_reps, n_feats), np.nan)
+
+    for r in range(n_reps):
+        idx    = rng.choice(X.shape[0], size=size, replace=True)
+        df_sub = run_for_dataset(X[idx], y[idx], col_idx)
+        all_rhos[r] = df_sub.sort_values("feature_idx")["spearman_rho"].values
+
+    alpha    = (100 - ci) / 2
+    mean_rho = np.nanmean(all_rhos, axis=0)
+    lo       = np.nanpercentile(all_rhos, alpha,       axis=0)
+    hi       = np.nanpercentile(all_rhos, 100 - alpha, axis=0)
+    rows = [{"feature_idx": j, "spearman_rho": mean_rho[j], "ci_lo": lo[j], "ci_hi": hi[j]}
+            for j in range(n_feats)]
+    return pd.DataFrame(rows)
+
+
+def run_permutation_test(X_m, y_m, X_f, y_f, col_idx, n_reps, seed):
+    """
+    For each feature, test whether the observed difference in Spearman rho
+    between males and females is significant by permuting gender labels.
+    Returns DataFrame with observed delta_rho and p-value per feature.
+    """
+    n_feats = X_m.shape[2]
+    rng     = np.random.default_rng(seed)
+
+    # pool all subjects
+    X_all = np.concatenate([X_m, X_f], axis=0)
+    y_all = np.concatenate([y_m, y_f], axis=0)
+    n_m   = X_m.shape[0]
+    N     = X_all.shape[0]
+
+    # observed rho difference
+    df_m_obs = run_for_dataset(X_m, y_m, col_idx).sort_values("feature_idx")
+    df_f_obs = run_for_dataset(X_f, y_f, col_idx).sort_values("feature_idx")
+    obs_delta = df_m_obs["spearman_rho"].values - df_f_obs["spearman_rho"].values
+
+    # permutation null distribution
+    null_deltas = np.full((n_reps, n_feats), np.nan)
+    for r in range(n_reps):
+        perm   = rng.permutation(N)
+        idx_m  = perm[:n_m]
+        idx_f  = perm[n_m:]
+        d_m    = run_for_dataset(X_all[idx_m], y_all[idx_m], col_idx).sort_values("feature_idx")
+        d_f    = run_for_dataset(X_all[idx_f], y_all[idx_f], col_idx).sort_values("feature_idx")
+        null_deltas[r] = d_m["spearman_rho"].values - d_f["spearman_rho"].values
+
+    # two-sided p-value: proportion of permutations with |delta| >= |observed|
+    p_vals = np.mean(np.abs(null_deltas) >= np.abs(obs_delta), axis=0)
+
+    rows = [{"feature_idx": j, "delta_rho": obs_delta[j], "p_value": p_vals[j]}
+            for j in range(n_feats)]
+    return pd.DataFrame(rows)
+
+
+def plot_balance(df_m_boot, df_f_boot, col_name, out_path, df_perm=None):
+    """Bootstrap CI for male and female Spearman rho per feature.
+    Permutation test p-values annotated as stars if df_perm is provided."""
+    n_feats = len(df_m_boot)
+    x       = np.arange(n_feats)
+    feature_labels = [f"f{j+1}" for j in range(n_feats)]
+
+    fig, ax = plt.subplots(figsize=(22, 8))
+    ax.axhline(0, linewidth=1, color="black")
+
+    for df, label, color in [
+        (df_m_boot, "Male",   "darkorange"),
+        (df_f_boot, "Female", "mediumseagreen"),
+    ]:
+        df   = df.sort_values("feature_idx").reset_index(drop=True)
+        vals = df["spearman_rho"].values
+        ax.plot(x, vals, color=color, linewidth=1.5, label=label, marker="o", markersize=3)
+        ax.fill_between(x, df["ci_lo"].values, df["ci_hi"].values, color=color, alpha=0.2)
+
+    # annotate permutation test significance at top of plot
+    if df_perm is not None:
+        df_perm = df_perm.sort_values("feature_idx").reset_index(drop=True)
+        y_star  = 0.72
+        for j, p in enumerate(df_perm["p_value"].values):
+            if p < 0.001:
+                stars = "***"
+            elif p < 0.01:
+                stars = "**"
+            elif p < 0.05:
+                stars = "*"
+            else:
+                continue
+            ax.text(j, y_star, stars, ha="center", va="bottom", fontsize=8, color="black")
+
+    ax.set_ylim(-0.8, 0.8)
+    _add_family_annotations(ax, n_feats, FEATURE_FAMILY_MAP, -0.8, 0.8)
+    ax.tick_params(axis="y", labelsize=28)
+    ax.set_ylabel("Spearman ρ", fontsize=24)
+    ax.set_title(f"{col_name}", fontsize=24)
+    ax.set_xlabel("Features", fontsize=24)
+    ax.set_xticks(x)
+    ax.set_xticklabels(feature_labels, rotation=90, ha="center", fontsize=22)
+    ax.legend(fontsize=17)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
 
 # =========================
 # RUN
@@ -255,12 +360,14 @@ for MODULE_TAG, EXCLUDE_MODULE_4 in SCENARIOS:
     mask_m = is_male(y_s[:, GENDER_IDX])
     mask_f = is_female(y_s[:, GENDER_IDX])
 
+    print(f"N_male={mask_m.sum()} | N_female={mask_f.sum()}")
+
     for c in TARGET_COLS:
         col_name = Y_COL_NAMES[c]
 
-        df_all = run_for_dataset(X_s,          y_s,          c, seed_base=0)
-        df_m   = run_for_dataset(X_s[mask_m],  y_s[mask_m],  c, seed_base=10_000)
-        df_f   = run_for_dataset(X_s[mask_f],  y_s[mask_f],  c, seed_base=20_000)
+        df_all = run_for_dataset(X_s,         y_s,         c)
+        df_m   = run_for_dataset(X_s[mask_m], y_s[mask_m], c)
+        df_f   = run_for_dataset(X_s[mask_f], y_s[mask_f], c)
 
         datasets = [("combined", df_all), ("male", df_m), ("female", df_f)]
         out_path = OUT_DIR / f"{col_name}_{MODULE_TAG}_bars.png"
@@ -271,3 +378,17 @@ for MODULE_TAG, EXCLUDE_MODULE_4 in SCENARIOS:
             out_path=out_path,
         )
         print(f"Saved: {out_path}")
+
+        # ---- gender balance analysis ----
+        X_m, y_m = X_s[mask_m], y_s[mask_m]
+        X_f, y_f = X_s[mask_f], y_s[mask_f]
+
+        n_matched = min(X_m.shape[0], X_f.shape[0])
+        df_m_boot = run_bootstrap_ci(X_m, y_m, c, N_BOOTSTRAP_REPS, BOOTSTRAP_CI, RNG_SEED, resample_size=n_matched)
+        df_f_boot = run_bootstrap_ci(X_f, y_f, c, N_BOOTSTRAP_REPS, BOOTSTRAP_CI, RNG_SEED, resample_size=n_matched)
+
+        plot_balance(
+            df_m_boot, df_f_boot,
+            col_name=col_name,
+            out_path=BALANCE_DIR / f"{col_name}_{MODULE_TAG}_balance.png",
+        )
